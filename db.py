@@ -1,136 +1,176 @@
 import sqlite3
-import hashlib
-import json
-from pathlib import Path
-from datetime import datetime
+import os
+from contextlib import contextmanager
 
-DB_PATH = Path(__file__).parent / "interview_portal.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interview_portal.db")
 
-def connect():
-    return sqlite3.connect(DB_PATH)
 
-def hash_password(password):
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def init_db():
-    con = connect()
-    cur = con.cursor()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS interviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT,
+                interview_type TEXT,
+                difficulty TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interview_id INTEGER NOT NULL,
+                question TEXT,
+                answer TEXT,
+                score REAL,
+                feedback TEXT,
+                category TEXT DEFAULT 'interview',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(interview_id) REFERENCES interviews(id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS typing_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                wpm REAL,
+                accuracy REAL,
+                duration_seconds REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS communication_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                pace_score REAL,
+                presence_score REAL,
+                overall_score REAL,
+                feedback TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
+
+def create_user(username, password):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+
+
+def get_user(username, password):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username=? AND password=?", (username, password)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_interview(user_id, role, interview_type, difficulty):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO interviews (user_id, role, interview_type, difficulty) VALUES (?, ?, ?, ?)",
+            (user_id, role, interview_type, difficulty),
         )
-    """)
+        return cur.lastrowid
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS interviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            interview_type TEXT NOT NULL,
-            difficulty TEXT NOT NULL,
-            score REAL NOT NULL,
-            question_count INTEGER NOT NULL,
-            results_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
+
+def get_user_by_id(user_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def save_result(interview_id, question, answer, score, feedback, category="interview"):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO results (interview_id, question, answer, score, feedback, category) VALUES (?, ?, ?, ?, ?, ?)",
+            (interview_id, question, answer, score, feedback, category),
         )
-    """)
 
-    con.commit()
-    con.close()
 
-def create_user(name, email, password):
-    con = connect()
-    try:
-        con.execute(
-            "INSERT INTO users(name,email,password_hash,created_at) VALUES(?,?,?,?)",
-            (name.strip(), email.strip().lower(), hash_password(password),
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+def save_typing_result(user_id, wpm, accuracy, duration_seconds):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO typing_results (user_id, wpm, accuracy, duration_seconds) VALUES (?, ?, ?, ?)",
+            (user_id, wpm, accuracy, duration_seconds),
         )
-        con.commit()
-        return True, "Account created successfully."
-    except sqlite3.IntegrityError:
-        return False, "An account with this email already exists."
-    finally:
-        con.close()
 
-def authenticate_user(email, password):
-    con = connect()
-    row = con.execute(
-        "SELECT id,name,email FROM users WHERE email=? AND password_hash=?",
-        (email.strip().lower(), hash_password(password))
-    ).fetchone()
-    con.close()
 
-    if row:
-        return {"id": row[0], "name": row[1], "email": row[2]}
-    return None
+def save_communication_result(user_id, pace_score, presence_score, overall_score, feedback):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO communication_results
+               (user_id, pace_score, presence_score, overall_score, feedback)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, pace_score, presence_score, overall_score, feedback),
+        )
 
-def save_interview(user_id, meta, score, results):
-    con = connect()
-    con.execute("""
-        INSERT INTO interviews(
-            user_id,role,interview_type,difficulty,score,
-            question_count,results_json,created_at
-        ) VALUES(?,?,?,?,?,?,?,?)
-    """, (
-        user_id,
-        meta["role"],
-        meta["type"],
-        meta["difficulty"],
-        float(score),
-        len(results),
-        json.dumps(results),
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ))
-    con.commit()
-    con.close()
 
-def get_user_interviews(user_id):
-    con = connect()
-    rows = con.execute("""
-        SELECT role, interview_type, difficulty, score,
-               question_count, created_at
-        FROM interviews
-        WHERE user_id=?
-        ORDER BY id DESC
-    """, (user_id,)).fetchall()
-    con.close()
+def get_user_results(user_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT r.*, i.role, i.interview_type, i.difficulty, i.created_at as interview_date
+               FROM results r
+               JOIN interviews i ON r.interview_id = i.id
+               WHERE i.user_id = ?
+               ORDER BY r.created_at DESC""",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
-    return [
-        {
-            "role": r[0],
-            "interview_type": r[1],
-            "difficulty": r[2],
-            "score": r[3],
-            "question_count": r[4],
-            "created_at": r[5],
-        }
-        for r in rows
-    ]
 
-def get_user_stats(user_id):
-    con = connect()
-    row = con.execute("""
-        SELECT COUNT(*), COALESCE(AVG(score),0),
-               COALESCE(MAX(score),0)
-        FROM interviews WHERE user_id=?
-    """, (user_id,)).fetchone()
+def get_user_typing_results(user_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM typing_results WHERE user_id=? ORDER BY created_at DESC", (user_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
-    latest = con.execute("""
-        SELECT role FROM interviews
-        WHERE user_id=? ORDER BY id DESC LIMIT 1
-    """, (user_id,)).fetchone()
-    con.close()
 
-    return {
-        "count": row[0],
-        "avg": row[1],
-        "best": row[2],
-        "latest_role": latest[0] if latest else None,
-    }
+def get_user_communication_results(user_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM communication_results WHERE user_id=? ORDER BY created_at DESC", (user_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_candidates_summary():
+    """Admin view: one row per user with aggregate stats."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT u.username,
+                      COUNT(DISTINCT i.id) as total_interviews,
+                      AVG(r.score) as avg_score,
+                      MAX(r.created_at) as last_activity
+               FROM users u
+               LEFT JOIN interviews i ON i.user_id = u.id
+               LEFT JOIN results r ON r.interview_id = i.id
+               GROUP BY u.id
+               ORDER BY last_activity DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
